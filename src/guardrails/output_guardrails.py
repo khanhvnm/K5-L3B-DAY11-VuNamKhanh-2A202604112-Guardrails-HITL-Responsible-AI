@@ -37,20 +37,21 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    redacted = response or ""
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+    # Keep specific patterns separate so the issue report says what was found.
+    # Phone and ID patterns require digit boundaries to avoid matching part of
+    # a longer numeric identifier.
+    pii_patterns = {
+        "Vietnamese phone number": r"(?<!\d)(?:0\d{9,10}|\+84\d{9,10})(?!\d)",
+        "email address": r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])",
+        "national ID (CMND/CCCD)": r"(?<!\d)(?:\d{9}|\d{12})(?!\d)",
+        "API key": r"\bsk-[A-Za-z0-9-]{8,}\b",
+        "password": r"\b(?:password|passcode|mật\s*khẩu)\s*(?::|=|\bis\b|\blà\b)\s*[^\s,;]+",
     }
 
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+    for name, pattern in pii_patterns.items():
+        matches = list(re.finditer(pattern, redacted, re.IGNORECASE))
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
@@ -172,16 +173,34 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filtered = content_filter(response_text)
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            replacement = filtered["redacted"]
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=replacement)],
+            )
+            # Judge only the sanitized content, never the original leaked text.
+            response_text = replacement
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(response_text)
+            if not judge_result.get("safe", False):
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text=(
+                                "I can’t share personal or confidential information. "
+                                "I can help with your VinBank banking question."
+                            )
+                        )
+                    ],
+                )
+
+        return llm_response
 
 
 # ============================================================
